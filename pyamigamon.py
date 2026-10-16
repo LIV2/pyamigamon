@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Matthew Harlum
-"""pyamigamon - crash monitor for an Amiga running Kickstart 3.x (SAD).
+"""pyamigamon - crash monitor for an Amiga running Kickstart 2.0 or later.
 
 Waits on the serial port for the Amiga to crash. When a dead-end alert
 ("guru") happens, exec blinks the power LED for a few seconds before
 rebooting; during that window a DEL (0x7F) on the serial port drops it into
-SAD. We keep sending DEL until the Amiga answers, connect to SAD with
-pyamigadebug, report the guru number and PC, then drop into a small
-interactive monitor for inspecting the crashed machine.
+the ROM debugger: SAD on Kickstart 3.0/3.1, RomWack on 2.x, 3.1.4 and 3.2. We keep
+sending DEL until the Amiga answers, connect with pyamigadebug, report the
+guru number and PC, then drop into a small interactive monitor for
+inspecting the crashed machine.
 """
 import argparse
 import contextlib
 import datetime
 import os
+import re
 import struct
 import sys
 import time
@@ -23,6 +25,7 @@ import serial
 
 HISTORY_FILE = os.path.expanduser("~/.pyamigamon_history")
 HISTORY_LENGTH = 1000
+_history_loaded = False
 DEFAULT_PYAMIGADEBUG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyamigadebug")
 
 # Exec stashes the last dead-end alert in low memory so it survives a reset
@@ -42,6 +45,9 @@ SAD_D0 = 16
 SAD_A0 = 48
 SAD_SR = 80
 SAD_PC = 82
+FRAME_SEARCH_BELOW = 0x80  # how far around SSP to look for a crash frame (Kickstart < 3.0)
+FRAME_SEARCH_ABOVE = 0x40
+SR_ZERO_BITS = 0x08E0      # SR bits that always read 0 on a 68010-68060
 SAD_FRAME_SIZE = 8  # SR, PC, format word (zero filler on a 68000)
 SAD_READ = SAD_SR + SAD_FRAME_SIZE + 92  # plus the largest (format $B) exception frame
 
@@ -70,6 +76,7 @@ EXCEPTION_NAMES.update({32 + i: f"TRAP #{i}" for i in range(16)})
 EXEC_INTVECTS = 84
 EXEC_THISTASK = 276
 EXEC_IDNESTCNT = 294  # followed by TDNestCnt
+EXEC_ATTNFLAGS = 296
 EXEC_DEVICELIST = 350
 EXEC_RESOURCELIST = 336
 EXEC_LIBLIST = 378
@@ -142,7 +149,7 @@ CLI_COMMANDNAME = 16
 CLI_MODULE = 60
 NT_TASK = 1
 NT_PROCESS = 13
-# Registers saved around exec calls made through SAD ("sp" is the user stack pointer)
+# Registers saved around exec calls made through the debugger ("sp" is the user stack pointer)
 CALL_REGS = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
              "a0", "a1", "a2", "a3", "a4", "a5", "a6", "sp", "pc"]
 TASK_STATES = {0: "inval", 1: "added", 2: "run", 3: "ready", 4: "wait", 5: "except", 6: "removed"}
@@ -333,7 +340,7 @@ MODE_OLDFILE = 1005
 MODE_NEWFILE = 1006
 SHARED_LOCK = -2
 DOS_CHUNK = 8192
-# Return path for non-exec library calls made through SAD:
+# Return path for non-exec library calls made through the debugger:
 #   move.l 4.w,a6 ; jmp _LVODebug(a6)
 DEBUG_STUB = bytes.fromhex("2C780004" "4EEEFF8E")
 DOS_ERRORS = {103: "ERROR_NO_FREE_STORE", 202: "ERROR_OBJECT_IN_USE", 203: "ERROR_OBJECT_EXISTS",
@@ -377,16 +384,6 @@ HUNK_DREL32 = 0x3F7        # RELOC32SHORT in executables (what LoadSeg does sinc
 HUNK_RELOC32SHORT = 0x3FC
 
 
-def wait_for_crash(ser, interval):
-    """Send DEL until the Amiga responds, i.e. it is in the alert blink loop."""
-    print("Waiting for Amiga to crash (guru blink)...")
-    while not ser.in_waiting:
-        ser.write(b"\x7F")
-        ser.flush()
-        time.sleep(interval)
-    print("Amiga responded, entering SAD.")
-
-
 def be16(buf, offset):
     return int.from_bytes(buf[offset:offset + 2], "big")
 
@@ -397,6 +394,8 @@ def be32(buf, offset):
 
 def cpu_name(attn):
     cpu = next((name for bit, name in CPU_FLAGS if attn & bit), "68000")
+    if not attn & 0x88:
+        attn &= ~0x40  # exec 2.04 sets the 68040 FPU bit on a 68030 with a 68881
     fpu = next((name for bit, name in FPU_FLAGS if attn & bit), None)
     return f"{cpu}/{fpu}" if fpu else cpu
 
@@ -527,8 +526,174 @@ class SadContext:
         for name, regs in (("D", self.d), ("A", self.a)):
             for base in (0, 4):
                 print("  " + "  ".join(f"{name}{i} {regs[i]:08X}" for i in range(base, min(base + 4, len(regs)))))
-        print(f"  USP {self.usp:08X}  SSP {self.ssp:08X}  VBR {self.vbr:08X}  CPU {cpu_name(self.attn)}")
+        vbr = f"{self.vbr:08X}" if self.vbr is not None else "?"
+        print(f"  USP {self.usp:08X}  SSP {self.ssp:08X}  VBR {vbr}  CPU {cpu_name(self.attn)}")
         print(f"  SR  {self.sr:04X} ({format_sr(self.sr)})  PC {self.pc:08X}")
+
+
+class RomWackContext:
+    """Registers from RomWack's regs command, plus the crash's exception frame.
+
+    On a crash, RomWack shows the crashing code's own state, and the CPU
+    exception frame is at SSP (checked on Kickstart 3.2).
+    """
+
+    REGS_RE = re.compile(r"PC: ([0-9A-F]+) +SR: ([0-9A-F]+) +USP: ([0-9A-F]+) +SSP: ([0-9A-F]+) +"
+                         r"(?:XCPT|TRAP): ([0-9A-F]+) +TASK: ([0-9A-F]+)")
+
+    def __init__(self, amiga, alert=None):
+        # Parsed here rather than with pyamigadebug's getmachinestate(), which
+        # expects a 4 digit XCPT; after a guru it holds the 8 digit alert number.
+        amiga.serial.write(b"regs\r")
+        amiga.serial.flush()
+        lines = [amiga.serial.readline().decode("latin-1") for _ in range(5)]
+        match = next(m for m in map(self.REGS_RE.search, lines) if m)
+        values = lambda tag: next(l for l in lines if l.lstrip().startswith(tag)).split()[1:]
+        self.pc, self.sr, self.usp, self.ssp, self.xcpt, self.task = (int(x, 16) for x in match.groups())
+        self.d = [int(x, 16) for x in values("DR:")][:8]
+        self.a = [int(x, 16) for x in values("AR:")][:7]
+        self.vbr = None  # RomWack doesn't show it
+        self.attn = amiga.peek16(amiga.peek32(4) + EXEC_ATTNFLAGS)
+        self.has_format = bool(self.attn & AFF_68010)
+        self.crash = None
+        # Before Kickstart 3.0, exec's crash path doesn't leave the stack the way
+        # RomWack expects, so its registers are junk (checked on 2.04) and the
+        # exception frame isn't at SSP, but is still close by.
+        self.unreliable = getattr(amiga, "entry", None) == "Crash" and \
+            amiga.peek16(amiga.peek32(4) + LIB_VERSION) < 39
+        if alert is not None and (alert & 0x7FFFFF00) == 0:
+            vector = alert & 0xFF
+            if self.unreliable:
+                self.crash = self.find_frame(amiga, vector)
+            else:
+                frame = decode_frame(amiga.readmem(self.ssp, 92), 0, self.has_format, vector)
+                if frame and frame["vector"] == vector:
+                    frame["addr"] = self.ssp
+                    self.crash = frame
+
+    def find_frame(self, amiga, vector):
+        """Search the supervisor stack around SSP for the crash's exception frame."""
+        start = self.ssp - FRAME_SEARCH_BELOW
+        buf = amiga.readmem(start, FRAME_SEARCH_BELOW + FRAME_SEARCH_ABOVE + 92)
+        for off in range(0, FRAME_SEARCH_BELOW + FRAME_SEARCH_ABOVE, 2):
+            sr = be16(buf, off)
+            if sr & SR_ZERO_BITS:
+                continue
+            frame = decode_frame(buf, off, self.has_format, vector)
+            if not frame or frame["vector"] != vector or frame["pc"] & 1 or frame["pc"] < 0x400:
+                continue
+            if self.has_format and frame["format"] not in (0, 2, 0xA, 0xB):
+                continue
+            frame["addr"] = start + off
+            if frame["details"]:
+                # Exec stores registers right after the first 8 bytes of the frame
+                frame["details"] = []
+                frame["note"] = ("the rest of this frame format is overwritten by exec on "
+                                 "Kickstart < 3.0, so fault details aren't shown")
+            return frame
+        return None
+
+    def print_registers(self):
+        if self.unreliable:
+            print("  Warning: before Kickstart 3.0, RomWack's registers after a crash are not "
+                  "the crashing code's; use the exception frame below.")
+        SadContext.print_registers(self)
+
+
+def read_context(amiga, alert=None):
+    """The debugger's saved register state (SadContext or RomWackContext)."""
+    if amiga.debugger == "RomWack":
+        return RomWackContext(amiga, alert)
+    return SadContext(amiga, alert)
+
+
+class PushbackSerial:
+    """A serial port wrapper that can push bytes back, so they can be read again.
+
+    Used to identify the debugger from its greeting and then hand that
+    greeting to pyamigadebug, which expects to read it itself.
+    """
+
+    def __init__(self, ser):
+        object.__setattr__(self, "_ser", ser)
+        object.__setattr__(self, "_buf", bytearray())
+
+    def unread(self, data):
+        self._buf[:0] = data
+
+
+    @property
+    def in_waiting(self):
+        return len(self._buf) + self._ser.in_waiting
+
+    def read(self, size=1):
+        data = bytes(self._buf[:size])
+        del self._buf[:size]
+        if len(data) < size:
+            data += self._ser.read(size - len(data))
+        return data
+
+    def readline(self):
+        line = bytearray()
+        while self._buf:
+            line += self.read(1)
+            if line.endswith(b"\n"):
+                return bytes(line)
+        return bytes(line) + self._ser.readline()
+
+    def __getattr__(self, name):
+        return getattr(self._ser, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._ser, name, value)
+
+
+def wait_for_debugger(ser, probe, interval):
+    """Wait for SAD's header or RomWack's banner; returns "SAD" or "RomWack".
+
+    With probe, sends DEL whenever the line is quiet: during the power LED
+    blink after a dead-end alert, that drops the Amiga into its debugger.
+    Anything else the Amiga sends (e.g. debug output) is skipped, and probing
+    carries on until a debugger actually answers. SAD's header is pushed back
+    so pyamigadebug's SAD class can read it.
+    """
+    seen = b""
+    old_timeout = ser.timeout
+    ser.timeout = interval
+    try:
+        while True:
+            data = ser.read(1)
+            if not data:
+                if probe:
+                    ser.write(b"\x7F")
+                    ser.flush()
+                continue
+            seen = (seen + data)[-8:]
+            if seen.endswith(b"rom-wack"):
+                return "RomWack"
+            if seen.endswith(b"SAD"):
+                entry = ser.read(1)
+                if entry in (b"\xBF", b"\x3F", b"\x21"):  # NMI, Debug(), crash
+                    ser.unread(b"SAD" + entry)
+                    return "SAD"
+    finally:
+        ser.timeout = old_timeout
+
+
+def connect(ser, debug, probe, interval):
+    """Wait for the Amiga's debugger and return a connected pyamigadebug object."""
+    kind = wait_for_debugger(ser, probe, interval)
+    if kind == "SAD":
+        from SAD import SAD
+        return SAD(serial=ser, Debug=debug)
+    from RomWack import RomWack
+    amiga = RomWack(serial=ser, Debug=debug)
+    # RomWack doesn't say how it was entered, but its XCPT field is 0 after
+    # Debug() and holds the alert number after a guru.
+    xcpt = RomWackContext(amiga).xcpt
+    amiga.entry = "Debug()" if xcpt == 0 else "Crash" if xcpt & 0x80000000 or \
+        amiga.peek32(HELP_ADDR) == HELP_MAGIC else f"exception ${xcpt:X}"
+    return amiga
 
 
 def print_crash_frame(ctx, alert):
@@ -543,8 +708,19 @@ def print_crash_frame(ctx, alert):
     print(f"  Exception: {exception_name(frame['vector'])} (vector {frame['vector']}{fmt}) in {mode} mode")
     print(f"  Fault PC:  ${frame['pc']:08X}")
     print(f"  Fault SR:  ${frame['sr']:04X} ({format_sr(frame['sr'])})")
+    if frame["pc"] < 0x400:
+        print("  Warning:   the fault PC is inside the exception vector table: a jump through a "
+              "null or garbage pointer, or (with RomWack) the debugger faulting on a stale DEL "
+              "left by crash probing; see the README.")
+    elif (frame["sr"] >> 8) & 7 == 7:
+        # Seen on Kickstart 3.2: exec's dead-end alert handling (which runs at IPL 7)
+        # occasionally faults itself, and RomWack shows that fault instead.
+        print("  Warning:   this exception happened at IPL 7, so it may be a fault inside exec's "
+              "alert handling rather than the original crash.")
     for label, text in frame["details"]:
         print(f"  {label}: {text}")
+    if frame.get("note"):
+        print(f"  Note:      {frame['note']}")
     print(f"  Frame at ${frame['addr']:08X}, stack before exception ${frame['addr'] + frame['size']:08X}")
 
 
@@ -614,24 +790,27 @@ def load_hunks(path):
 
 
 def report_guru(amiga):
-    print(f"SAD entry: {amiga.entry}")
+    print(f"{amiga.debugger} entry: {amiga.entry}")
     if amiga.entry != "Crash":
-        print("Not a crash entry (SAD was entered via NMI or Debug()), no guru to report.")
+        print("Not a crash entry, no guru to report.")
         return None, None
     marker = amiga.peek32(HELP_ADDR)
     alert = amiga.peek32(ALERT_ADDR)
     task = amiga.peek32(TASK_ADDR)
-    pc = amiga.getreg("pc")
-    d7 = amiga.getreg("d7")
     if marker != HELP_MAGIC:
-        # No 'HELP' marker; Alert() still has the alert number in D7.
-        print(f"Warning: no 'HELP' marker at $0 (found ${marker:08X}), using D7 as alert number.")
-        alert = d7
-    ctx = SadContext(amiga, alert)
+        # No 'HELP' marker; Alert() still has the alert number in D7 (and RomWack shows it).
+        ctx = read_context(amiga)
+        alert = getattr(ctx, "xcpt", 0) or ctx.d[7]
+        print(f"Warning: no 'HELP' marker at $0 (found ${marker:08X}); alert number taken from the debugger.")
+    ctx = read_context(amiga, alert)
     print("*** GURU MEDITATION ***")
     print(f"  Alert: #{alert >> 16:04X}.{alert & 0xFFFF:04X}  (${alert:08X})")
     print(f"  Task:  ${task:08X}")
-    print(f"  SAD entry PC: ${pc:08X} (inside exec's alert handling)")
+    if amiga.debugger == "SAD":
+        print(f"  SAD entry PC: ${ctx.pc:08X} (inside exec's alert handling)")
+    else:
+        if not getattr(ctx, "unreliable", False):
+            print(f"  PC:    ${ctx.pc:08X}")
     print_crash_frame(ctx, alert)
     return task, alert
 
@@ -769,10 +948,13 @@ class Monitor:
             import readline
         except ImportError:  # e.g. Windows without pyreadline
             return None
-        try:
-            readline.read_history_file(HISTORY_FILE)
-        except OSError:
-            pass
+        global _history_loaded
+        if not _history_loaded:  # once per run, not once per session
+            _history_loaded = True
+            try:
+                readline.read_history_file(HISTORY_FILE)
+            except OSError:
+                pass
         readline.set_history_length(HISTORY_LENGTH)
         names = sorted(self.commands)
 
@@ -924,10 +1106,10 @@ class Monitor:
         lower, upper, spreg = be32(tc, TC_SPLOWER), be32(tc, TC_SPUPPER), be32(tc, TC_SPREG)
         print(f"  Stack     ${lower:08X}-${upper:08X} ({upper - lower} bytes)")
         if running:
-            # Its live registers are in SAD's context, not at tc_SPReg
-            ctx = SadContext(self.amiga)
+            # Its live registers are in the debugger's context, not at tc_SPReg
+            ctx = read_context(self.amiga)
             sp = ctx.usp if not ctx.sr & 0x2000 else None
-            print("  Running   registers are in SAD's context (see r)")
+            print("  Running   registers are in the debugger's context (see r)")
             if sp is None:
                 return
         else:
@@ -1228,8 +1410,8 @@ class Monitor:
         self.next_addr = addr
 
     def cmd_registers(self, args):
-        """r               show registers saved on SAD entry, and the crash's exception frame"""
-        ctx = SadContext(self.amiga, self.alert)
+        """r               show the registers the debugger saved, and the crash's exception frame"""
+        ctx = read_context(self.amiga, self.alert)
         ctx.print_registers()
         if self.alert is not None:
             print_crash_frame(ctx, self.alert)
@@ -1431,6 +1613,9 @@ class Monitor:
         for hunk in hunks:
             offsets.append(total)
             total += (hunk["size"] + 7) & ~7
+        if not chip and self.amiga.peek16(execbase + LIB_VERSION) < 39:
+            print("MEMF_KICK needs Kickstart 3.0 (V39); using chip RAM, which is always there at reset.")
+            chip = True
         flags = MEMF_CLEAR | (MEMF_CHIP if chip else MEMF_KICK)
         block = self.amiga.libcall(base=execbase, lvo=LVO_ALLOCMEM, d0=total, d1=flags, result="d0")
         if not block:
@@ -1518,15 +1703,15 @@ class Monitor:
     def system_callable(self, what):
         """Can exec functions be called right now? Explain and return False if not.
 
-        Calls run in the context saved by SAD, as if that code had made them, so
+        Calls run in the context the debugger saved, as if that code had made them, so
         they need a task in user mode with interrupts on: exactly what a call to
         Debug() from a normal task gives, and what NMI and crash entries don't.
         """
         problems = []
         if self.amiga.entry != "Debug()":
-            problems.append(f"SAD was entered via {self.amiga.entry}, not Debug()")
+            problems.append(f"{self.amiga.debugger} was entered via {self.amiga.entry}, not Debug()")
         else:
-            ctx = SadContext(self.amiga)
+            ctx = read_context(self.amiga)
             execbase = self.amiga.peek32(4)
             nest = self.amiga.readmem(execbase + EXEC_IDNESTCNT, 2)
             idn, tdn = (int.from_bytes(nest[i:i + 1], "big", signed=True) for i in (0, 1))
@@ -1542,20 +1727,24 @@ class Monitor:
                       "anything that waits will let other tasks run.")
         if problems:
             print(f"Refusing {what}: " + "; ".join(problems) + ".")
-            print("It needs SAD entered via Debug() from a normal task (use --attach).")
+            print("It needs the debugger entered via Debug() from a normal task (use --attach).")
             return False
         return True
 
     def begin_calls(self):
         """Start a sequence of exec calls: save the context and Disable().
 
-        The calls clobber SAD's saved registers, so they're put back afterwards.
-        Interrupts are kept off whenever control is back in SAD between calls, as
-        amigaXfer does: SAD's serial handling is unreliable with interrupts on.
+        The calls clobber the debugger's saved registers, so they're put back
+        afterwards. Interrupts are kept off whenever control is back in the debugger
+        between calls, as amigaXfer does: its serial handling is unreliable with
+        interrupts on.
         I/O still completes, because Wait() switches to other tasks, which run
         with their own interrupt state.
         """
-        saved = self.amiga.getregs(CALL_REGS)
+        # RomWack can't read or set PC; resuming continues inside Debug(), which
+        # returns to its caller once the stack pointer is back where it was.
+        regs = CALL_REGS if self.amiga.debugger == "SAD" else [r for r in CALL_REGS if r != "pc"]
+        saved = self.amiga.getregs(regs)
         self.exec_call(LVO_DISABLE)
         return saved
 
@@ -1564,7 +1753,7 @@ class Monitor:
         self.amiga.setregs(saved)
 
     def lib_call(self, base, lvo, stub, **regs):
-        """Call a non-exec library function through SAD and return D0.
+        """Call a non-exec library function through the debugger and return D0.
 
         pyamigadebug makes the called function return straight into exec's
         Debug(), which needs A6 = ExecBase. Other libraries return with their
@@ -1579,7 +1768,7 @@ class Monitor:
             self.amiga.execdebug = old
 
     def exec_call(self, lvo, **regs):
-        """Call an exec function through SAD and return D0."""
+        """Call an exec function through the debugger and return D0."""
         return self.amiga.libcall(base=self.amiga.peek32(4), lvo=lvo, result="d0", **regs)
 
     def cmd_dread(self, args):
@@ -1846,7 +2035,7 @@ class Monitor:
         return False
 
     def cmd_resume(self, args):
-        """resume          leave SAD and let the Amiga carry on (ends the session)"""
+        """resume          leave the debugger and let the Amiga carry on (ends the session)"""
         if self.amiga.entry == "Crash":
             print("Can't resume from a crash; use reboot.")
             return
@@ -1861,7 +2050,7 @@ class Monitor:
             print("  " + doc)
 
     def cmd_quit(self, args):
-        """q               quit monitor (Amiga stays in SAD)"""
+        """q               quit monitor (Amiga stays in the debugger)"""
         return False
 
     commands = {
@@ -1900,31 +2089,41 @@ class Monitor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Report Amiga gurus via SAD over serial.")
+    parser = argparse.ArgumentParser(description="Report Amiga gurus via SAD or RomWack over serial.")
     parser.add_argument("port", help="serial device, e.g. /dev/cu.usbserial-XXXX")
     parser.add_argument("--pyamigadebug", default=os.environ.get("PYAMIGADEBUG", DEFAULT_PYAMIGADEBUG),
                         help="path to pyamigadebug checkout (default: ../pyamigadebug or $PYAMIGADEBUG)")
     parser.add_argument("--interval", type=float, default=0.3, help="seconds between DEL probes")
     parser.add_argument("--debug", action="store_true", help="verbose pyamigadebug output")
     parser.add_argument("--attach", action="store_true",
-                        help="don't wait for a crash; connect to SAD entered via Debug() or NMI")
+                        help="don't probe for a crash with DEL; just wait for the debugger to be "
+                             "entered via Debug() or NMI")
+    parser.add_argument("--once", action="store_true",
+                        help="exit after one session instead of waiting again after resume/reboot")
     args = parser.parse_args()
 
     sys.path.insert(0, os.path.abspath(args.pyamigadebug))
-    from SAD import SAD
 
-    # SAD talks at 9600 baud; pyamigadebug sets this too, but the DEL probe goes out first.
-    with serial.Serial(args.port, 9600, timeout=None, exclusive=True) as ser:
-        if args.attach:
-            print("Waiting for SAD (enter it with Debug(), NMI or the Workbench debug menu)...")
-        else:
-            wait_for_crash(ser, args.interval)
-        amiga = SAD(serial=ser, Debug=args.debug)
-        guru_task, alert = report_guru(amiga)
-        monitor = Monitor(amiga, guru_task, alert)
-        monitor.run()
-        if monitor.left_in_sad:
-            print("Amiga left in SAD.")
+    # Both debuggers run at 9600 baud; RomWack misses characters with 1 stop bit.
+    with serial.Serial(args.port, 9600, timeout=None, stopbits=2, exclusive=True) as port:
+        ser = PushbackSerial(port)
+        while True:
+            if args.attach:
+                print("Waiting for the debugger (enter it with Debug(), NMI or the Workbench debug menu)...")
+            else:
+                print("Waiting for a crash (guru blink) or for the debugger to be entered...")
+            amiga = connect(ser, args.debug, probe=not args.attach, interval=args.interval)
+            guru_task, alert = report_guru(amiga)
+            monitor = Monitor(amiga, guru_task, alert)
+            monitor.run()
+            if monitor.left_in_sad:
+                print(f"Amiga left in {amiga.debugger}.")
+                return
+            if args.once:
+                return
+            # Don't discard input here: the Amiga may already be back in the
+            # debugger (e.g. a second Debug() call), and SAD only greets once.
+            print()
 
 
 if __name__ == "__main__":

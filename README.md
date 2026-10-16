@@ -1,9 +1,10 @@
 # pyamigamon
 
-A crash monitor and debugger for Amigas running Kickstart 3.x, driven from
+A crash monitor and debugger for Amigas running Kickstart 2.0 or later, driven from
 another computer over the serial port.
 
-It uses SAD, the debugger built into the Kickstart 3.x ROM, through
+It uses the debugger built into the Kickstart ROM (SAD on Kickstart 3.0/3.1,
+RomWack on 2.x, 3.1.4 and 3.2) through
 [pyamigadebug](https://github.com/rvalles/pyamigadebug), so nothing needs to be
 installed on the Amiga. When the Amiga gurus, pyamigamon catches it before it
 reboots and reports the alert, the crashing task and (where it survived) the
@@ -14,10 +15,13 @@ usually takes out everything you'd normally use to investigate.
 
 ## Requirements
 
-- An Amiga with Kickstart 3.x (V39+; SAD first appeared in V39).
+- An Amiga with Kickstart 2.0 or later. Kickstart 3.0 and 3.1 have SAD; 2.x,
+  3.1.4 and 3.2 have RomWack instead. pyamigamon works out which one it's
+  talking to.
 - A serial connection to the Amiga's serial port (null-modem cable, or an
   emulator's serial port; see [Testing with Copperline](#testing-with-copperline)).
-  SAD always runs at 9600 baud.
+  Both debuggers run at 9600 baud; pyamigamon uses 8N2, since RomWack misses
+  characters with only one stop bit.
 - Python 3.8+ and [pyserial](https://pypi.org/project/pyserial/) (`pip install pyserial`).
 - A checkout of [pyamigadebug](https://github.com/rvalles/pyamigadebug). By
   default pyamigamon looks for it next to this repository (`../pyamigadebug`);
@@ -26,13 +30,14 @@ usually takes out everything you'd normally use to investigate.
 ## Usage
 
 ```
-python3 pyamigamon.py [--attach] [--interval SECS] [--debug] [--pyamigadebug PATH] PORT
+python3 pyamigamon.py [--attach] [--once] [--interval SECS] [--debug] [--pyamigadebug PATH] PORT
 ```
 
 | Option | |
 |---|---|
 | `PORT` | Serial device, e.g. `/dev/cu.usbserial-XXXX` or an emulator's pty |
-| `--attach` | Don't wait for a crash; connect to SAD entered via `Debug()` or NMI |
+| `--attach` | Don't probe for a crash with DEL; just wait for the debugger to be entered via `Debug()` or NMI (see [Sessions](#sessions)) |
+| `--once` | Exit after one session instead of waiting for the next one |
 | `--interval` | Seconds between DEL probes while waiting for a crash (default 0.3) |
 | `--debug` | Verbose pyamigadebug output |
 | `--pyamigadebug` | Path to the pyamigadebug checkout |
@@ -45,8 +50,8 @@ python3 pyamigamon.py /dev/cu.usbserial-XXXX
 
 When a dead-end alert happens, Kickstart 3.x blinks the power LED for a few
 seconds before rebooting, and a DEL character on the serial port during that
-window drops it into SAD. pyamigamon keeps sending DEL until the Amiga answers,
-so start it before the crash and leave it waiting.
+window drops it into the ROM debugger. pyamigamon keeps sending DEL until the
+Amiga answers, so start it before the crash and leave it waiting.
 
 ```
 *** GURU MEDITATION ***
@@ -62,27 +67,43 @@ Monitor ready. Type ? for help. Up/down for history, tab completes commands.
 >
 ```
 
-**About the exception frame.** For a CPU exception that happened in
-*supervisor* mode (interrupt code, `Supervisor()`, exec internals), the
-crash's own exception frame sits right after SAD's, and pyamigamon decodes it:
-the faulting PC and SR, plus the fault address, SSW etc. for bus and address
-errors (68000 group 0 frames and 68010–68060 formats $0–$C). It only accepts a
-frame whose vector matches the alert number.
+**About the exception frame.** When a CPU exception caused the guru,
+pyamigamon decodes its exception frame: the faulting PC and SR, plus the
+fault address, SSW etc. for bus and address errors (68000 group 0 frames and
+68010–68060 formats $0–$C). It only accepts a frame whose vector matches the
+alert number. What survives depends on the Kickstart:
 
-For an exception in *user* mode (most task code, including a device's
-`BeginIO` and unit tasks), exec first shows the "Software Failure"
-requester. Choosing Reboot re-raises the alert from the requester's own code,
-and the original frame is gone; pyamigamon says so rather than guessing.
+- **Kickstart 3.0/3.1 (SAD):** for an exception in *supervisor* mode
+  (interrupt code, `Supervisor()`, exec internals), the crash's frame sits
+  right after SAD's own, and the report shows SAD's entry PC inside exec as
+  well. For an exception in *user* mode (most task code, including a
+  device's `BeginIO` and unit tasks), exec first shows the "Software
+  Failure" requester; choosing Reboot re-raises the alert from the
+  requester's own code, and the original frame is gone. pyamigamon says so
+  rather than guessing.
+- **Kickstart 3.1.4/3.2 (RomWack):** RomWack shows the crashing code's own
+  registers, and the frame is at its SSP, for both supervisor and user mode
+  (including after "Software Failure" and Reboot). Occasionally the
+  debugger faults on entry itself, and RomWack shows that second fault
+  instead, typically at PC `$1E2` inside the exception vector table (see
+  [Sessions](#sessions) for the cause). The report warns when a fault PC is
+  in the vector table or the SR is at IPL 7.
+- **Kickstart 2.x (RomWack):** exec's crash path doesn't leave the stack the
+  way RomWack expects, so RomWack's registers after a crash are junk (`r`
+  says so). pyamigamon searches the stack for the exception frame instead,
+  and finds it for supervisor-mode exceptions; it shows SR, PC and the
+  exception, but not the extra fields of longer frames, which exec
+  overwrites. As on 3.1, user-mode crashes lose their frame.
 
 ### Using it as a general monitor
 
-Put the Amiga into SAD on a healthy system and connect with `--attach`:
+Put the Amiga into its debugger on a healthy system and connect with `--attach`:
 
 ```
 python3 pyamigamon.py --attach /dev/cu.usbserial-XXXX
 ```
 
-Ways to enter SAD:
+Ways to enter the debugger:
 
 - Call `exec.library/Debug()`. A three-instruction program is enough, and
   calling `Debug()` from your own code works as a breakpoint:
@@ -95,8 +116,36 @@ Ways to enter SAD:
   (to the right of the normal menus).
 - An NMI, if your hardware can generate one.
 
-`resume` hands control back; all registers are restored, so the caller of
+`resume` hands control back; the registers are restored, so the caller of
 `Debug()` returns normally.
+
+### Sessions
+
+pyamigamon keeps running across sessions. After `resume` or `reboot` it goes
+back to waiting, and reconnects when the Amiga next enters its debugger,
+whether that's a crash, `Debug()` or an NMI, so one terminal can stay open
+through a whole edit/build/test cycle. `q` (or end of input) exits and leaves
+the Amiga in the debugger; `--once` exits after a single session.
+
+While waiting, pyamigamon sends DEL whenever the serial line is quiet, so it
+catches a crash during the power LED blink. It ignores any other serial
+output and keeps probing until a debugger actually answers.
+
+**DEL probing and RomWack.** On Kickstart 2.x, 3.1.4 and 3.2, the DEL bytes
+sent while the Amiga is running normally stay in the serial port's receive
+register, and RomWack reads that stale DEL when it's next entered. On 3.2
+this makes the debugger fault on entry, so a `Debug()` call or the
+Workbench debug menu shows up as a crash at PC `$1E2` instead of a normal
+session. Using `$FF` instead of DEL doesn't help: RomWack ignores bit 7, as
+the blink loop does. So on RomWack machines, choose per session:
+
+- **Catching crashes:** run without `--attach` (the default), and don't
+  enter the debugger with `Debug()` while it's waiting.
+- **Using `Debug()` or the debug menu:** run with `--attach`. Crashes then
+  blink and reboot without being caught.
+
+SAD (Kickstart 3.0/3.1) isn't affected: probing and `Debug()` entries mix
+freely.
 
 ## Commands
 
@@ -107,7 +156,7 @@ history is kept in `~/.pyamigamon_history`, and tab completes command names.
 
 | Command | |
 |---|---|
-| `r` | Registers saved on SAD entry (D0–D7, A0–A6, USP, SSP, SR, PC, VBR, CPU) and the crash's exception frame |
+| `r` | The registers the debugger saved (D0–D7, A0–A6, USP, SSP, SR, PC, VBR, CPU) and the crash's exception frame; RomWack doesn't show VBR |
 | `m [addr] [len]` | Hex/ASCII dump, default `$80` bytes; `m` alone continues where the last one ended |
 | `wb addr val ...` | Write bytes |
 | `ww addr val ...` | Write words (even address) |
@@ -164,7 +213,8 @@ the first values on its stack, which show where it called `Wait()` from:
 | `kick clear` | Clear the KickTags (takes effect at the next reboot) |
 
 `kick file` loads an Amiga executable, relocates it into a single
-`AllocMem(MEMF_KICK)` block (or chip RAM with `chip`), finds its ROM tags,
+`AllocMem(MEMF_KICK)` block (or chip RAM with `chip`, and always on
+Kickstart 2.x, which has no `MEMF_KICK`), finds its ROM tags,
 chains them onto any existing KickMem/KickTag entries and sets `KickCheckSum`
 using exec's `SumKickData()`. Because it calls exec functions it needs a
 healthy machine: it has the same requirements as `dread`/`dwrite` (see
@@ -190,7 +240,7 @@ These open the device and use `CMD_READ`/`CMD_WRITE` through `DoIO()`, in
 Offsets are 32-bit, so only the first 4 GB of a unit can be reached.
 
 Like `kick`, they call exec functions, so they only run when that's safe:
-SAD entered via `Debug()` (not NMI or a crash), called from user mode, not
+the debugger entered via `Debug()` (not NMI or a crash), called from user mode, not
 inside `Disable()`, with a valid running task. Otherwise they refuse and say
 why. The running system keeps going while the I/O is in progress, which is
 how the device's interrupts and unit task get to complete the request.
@@ -210,17 +260,18 @@ have the same requirements as device I/O, and additionally the caller must
 be a DOS process (a shell command, for example), not a plain task. "Insert
 volume" requesters are suppressed during the transfer, so a missing volume
 returns an error instead. `put` asks before overwriting when run
-interactively. Expect roughly 1 KB/s at 9600 baud. `ls` sorts entries by
+interactively. Expect roughly 1 KB/s at 9600 baud with SAD, and several
+times slower with RomWack (see [Limitations](#limitations)). `ls` sorts entries by
 name and shows dates as the Amiga stores them (local time, no time zone).
 
 ### Session
 
 | Command | |
 |---|---|
-| `reboot` | Reboot the Amiga and end the session |
-| `resume` | Return to the system and end the session (not possible after a crash) |
+| `reboot` | Reboot the Amiga, then wait for the next session |
+| `resume` | Return to the system, then wait for the next session (not possible after a crash) |
 | `?` | Help |
-| `q` | Quit, leaving the Amiga in SAD |
+| `q` | Quit, leaving the Amiga in the debugger |
 
 ## Testing with Copperline
 
@@ -258,10 +309,17 @@ Things to know:
 
 ## Limitations
 
-- Kickstart 3.x (SAD) only. Kickstart 1.x/2.x use RomWack, which pyamigadebug
-  supports but pyamigamon doesn't.
+- Kickstart 2.0 or later (tested on 2.04, 3.1 and 3.2). Kickstart 1.x also
+  uses RomWack, but several commands rely on functions and structures that
+  only exist from 2.0.
 - The serial link runs at 9600 baud, so large lists and memory dumps take a
   few seconds.
+- RomWack is a text interface, so data transfers are much slower than with
+  SAD: in testing, reading four disk blocks took 28 s instead of 2.5 s, and
+  writing 512 bytes to RAM: took 20 s. Writes are the slowest.
+- RomWack can't write single bytes: `wb` reads the word, changes one byte and
+  writes the word back. That's fine for RAM, but don't use `wb` on hardware
+  registers with RomWack; use `ww` instead.
 - After a guru, the system's own structures may be corrupt; treat what the
   monitor shows as evidence, not as guaranteed truth.
 - A task that was using the FPU when it was switched out has a larger saved
@@ -272,11 +330,11 @@ Things to know:
 
 pyamigamon is built on top of
 [pyamigadebug](https://github.com/rvalles/pyamigadebug) by
-[Roc Vallès i Domènech](https://rvalles.net/). Its implementation of the SAD
-protocol, and of calling Amiga system functions through it, is what makes
-pyamigamon possible. pyamigadebug also powers
+[Roc Vallès i Domènech](https://rvalles.net/). Its implementations of the SAD
+and RomWack protocols, and of calling Amiga system functions through them,
+are what make pyamigamon possible. pyamigadebug also powers
 [amigaXfer](https://github.com/rvalles/pyamigadebug), and its approach to
-safely driving a live system from SAD (such as disabling interrupts while
+safely driving a live system from the ROM debugger (such as disabling interrupts while
 in control) informed several design decisions here. Many thanks to Roc for
 creating it and releasing it as open source.
 
