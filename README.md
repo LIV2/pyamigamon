@@ -23,6 +23,7 @@ usually takes out everything you'd normally use to investigate.
   Both debuggers run at 9600 baud; pyamigamon uses 8N2, since RomWack misses
   characters with only one stop bit.
 - Python 3.8+ and [pyserial](https://pypi.org/project/pyserial/) (`pip install pyserial`).
+- Optionally [Capstone](https://pypi.org/project/capstone/) (`pip install capstone`) for the `di` disassembler.
 - A checkout of [pyamigadebug](https://github.com/rvalles/pyamigadebug). By
   default pyamigamon looks for it next to this repository (`../pyamigadebug`);
   use `--pyamigadebug PATH` or `$PYAMIGADEBUG` to point elsewhere.
@@ -158,6 +159,7 @@ history is kept in `~/.pyamigamon_history`, and tab completes command names.
 |---|---|
 | `r` | The registers the debugger saved (D0–D7, A0–A6, USP, SSP, SR, PC, VBR, CPU) and the crash's exception frame; RomWack doesn't show VBR |
 | `m [addr] [len]` | Hex/ASCII dump, default `$80` bytes; `m` alone continues where the last one ended |
+| `di [addr] [count]` | Disassemble `count` instructions (default 16) for the CPU in `AttnFlags`; starts at the saved PC, and `di` alone continues. Needs [Capstone](https://pypi.org/project/capstone/) |
 | `wb addr val ...` | Write bytes |
 | `ww addr val ...` | Write words (even address) |
 | `wl addr val ...` | Write longs (even address) |
@@ -223,6 +225,76 @@ healthy machine: it has the same requirements as `dread`/`dwrite` (see
 A module started from the KickTags has no expansion.library binding, so
 drivers that call `GetCurrentBinding()` to find their board won't work this
 way.
+
+### LoadSeg
+
+| Command | |
+|---|---|
+| `loadseg file` | Load an Amiga executable into memory as a DOS seglist |
+| `call [addr] [reg=val ...]` | `jsr` to `addr` (default: the last `loadseg`'s first hunk) with d0-d7/a0-a6 set, and show D0/D1/A0/A1 |
+| `allocmem size [chip\|fast]` | `AllocMem()` cleared public memory (any type by default) and show its address |
+| `freemem addr size` | `FreeMem()` a block; size must match what was allocated |
+
+`loadseg` does what dos.library's `LoadSeg()` does, without needing DOS:
+each hunk gets its own `AllocMem()` block (chip or fast as the hunk header
+asks), laid out so `UnLoadSeg()` can free it, and the hunks are relocated and
+linked into a seglist. It prints each hunk's address and the seglist BPTR,
+and leaves `m` pointing at the first hunk. Nothing frees it automatically.
+It has the same requirements as `kick`.
+
+`call` runs the code as a subroutine of the task that called `Debug()`, on
+that task's stack, with interrupts on; when it returns with `rts` the
+debugger's saved registers are put back, except D0/D1/A0/A1, which keep the
+results (as after any function call). If it crashes instead, the session
+is left in the new debugger entry; reconnect to look at it.
+
+### Single-stepping (SAD)
+
+| Command | |
+|---|---|
+| `step [n]` | Run `n` instructions (default 1), showing each instruction and the registers after it; `*` marks the ones that changed |
+| `stepto task` | Let the Amiga run until a task (name or address) is next scheduled, and stop in it after its first instruction |
+| `stepto addr` | Let the Amiga run until the PC reaches `addr`, in any task |
+| `stepto rts` | Step until the current function returns (an `rts`, `rtd` or `rtr` at this level), running the calls it makes at full speed |
+
+These use SAD's own single step (`TURN_ON_SINGLE`/`TURN_OFF_SINGLE`), which
+points the CPU's trace vector at SAD, so they need SAD (not RomWack) and an
+entry that can return to the system (not a crash). The trace vector is put
+back when the command finishes.
+
+The trace bit belongs to a task: exec saves it with the task's registers when
+it's switched out, and restores it when the task runs again. So `step` keeps
+following the task in the debugger, and if it waits (say inside `Wait()`),
+the step only completes once it runs again. `stepto` uses that: it sets the
+trace bit in the target task's saved registers, so it traps into SAD as soon
+as exec dispatches it. The target must be in the ready or wait list, and
+without saved FPU state.
+
+`stepto rts` single-steps the current function, printing each instruction,
+but doesn't step through the calls it makes. It steps into a `jsr`/`bsr`
+once, where the user stack pointer points at the return address, replaces
+that with the address of an `ILLEGAL` ($4AFC, the start of exec's RomTag),
+and points the illegal instruction vector at SAD. The callee then runs
+untraced, and its `rts` traps straight back into SAD, where the real return
+address goes back into the PC. It only works in user mode code; a task
+named `rts` can still be given by address.
+
+`stepto addr` takes any address that isn't a task in exec's lists. If `addr`
+is in RAM it runs at full speed: it puts an `ILLEGAL` at `addr` and points the
+illegal instruction vector at SAD, so whichever task gets there first stops
+with the PC on `addr` (pyamigamon says which task, if it isn't the one in the
+debugger), and the original word goes back. If the PC is on `addr` already,
+it steps off it first, so in a loop it stops on the next pass. `addr` must be
+the start of an instruction, as `di` shows them: an `ILLEGAL` in the middle
+of one would change its operand. ROM can't take a breakpoint, so for a ROM
+address it single-steps the task in the debugger until it gets there: that
+only catches this task, it's slow, and Ctrl-C stops it.
+
+Ctrl-C between steps stops `step` and `stepto rts` after the current
+instruction. While the Amiga is running (a step that waits, a call being run,
+or waiting for a task), pyamigamon can't stop it, so Ctrl-C only explains; a
+further Ctrl-C quits, leaving SAD's vectors installed (the originals are
+printed so you can put them back).
 
 ### Device I/O
 

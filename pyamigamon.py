@@ -16,6 +16,7 @@ import contextlib
 import datetime
 import os
 import re
+import signal
 import struct
 import sys
 import threading
@@ -157,6 +158,24 @@ NT_PROCESS = 13
 # Registers saved around exec calls made through the debugger ("sp" is the user stack pointer)
 CALL_REGS = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
              "a0", "a1", "a2", "a3", "a4", "a5", "a6", "sp", "pc"]
+CALL_ARG_REGS = CALL_REGS[:15]  # d0-d7, a0-a6: what call lets you set
+SCRATCH_REGS = ["d0", "d1", "a0", "a1"]  # not preserved across a function call
+# Disassembler: Capstone CPU mode by AttnFlags bit, newest first
+DISASM_CPUS = [(0x80, "CS_MODE_M68K_060"), (0x08, "CS_MODE_M68K_040"), (0x04, "CS_MODE_M68K_030"),
+               (0x02, "CS_MODE_M68K_020"), (0x01, "CS_MODE_M68K_010")]
+DISASM_COUNT = 16
+MAX_INSN_SIZE = 22  # longest 68k instruction, in bytes
+SR_T1 = 0x8000  # trace bit SAD's TURN_ON_SINGLE sets in the saved SR
+OP_ILLEGAL = 0x4AFC
+TRACE_PROGRESS = 0x100  # single steps between progress lines when tracing to a ROM address
+VEC_ILLEGAL = 0x10  # vector offsets from VBR
+VEC_TRACE = 0x24
+OP_RETURNS = (0x4E75, 0x4E74, 0x4E77)  # rts, rtd, rtr
+
+
+def is_call(op):
+    """jsr <ea> or bsr."""
+    return (op & 0xFFC0) == 0x4E80 or (op & 0xFF00) == 0x6100
 TASK_STATES = {0: "inval", 1: "added", 2: "run", 3: "ready", 4: "wait", 5: "except", 6: "removed"}
 MAX_LIST_NODES = 256  # stop walking a corrupt list instead of looping forever
 
@@ -362,8 +381,10 @@ IO_ERRORS = {-1: "IOERR_OPENFAIL", -2: "IOERR_ABORTED", -3: "IOERR_NOCMD", -4: "
              32: "TDERR_NoMem", 33: "TDERR_BadUnitNum", 34: "TDERR_BadDriveType",
              35: "TDERR_DriveInUse", 36: "TDERR_PostReset"}
 MEMF_CHIP = 0x2
+MEMF_FAST = 0x4
 MEMF_CLEAR = 0x10000
 MEMF_KICK = 0x400
+SEG_HEADER = 8  # LoadSeg() segment: allocation size, then BPTR to the next segment
 
 # KickMem block layout: MemList, then the KickTag table, then the hunks
 ML_NUMENTRIES = 14
@@ -516,13 +537,18 @@ class SadContext:
         # SAD's own frame is always SR, PC and a format word: a real format 0 frame on
         # 68010+, and a zero filler word on a 68000 (checked on Kickstart 3.1).
         self.sr, self.pc = be16(buf, SAD_SR), be32(buf, SAD_PC)
-        # Supervisor stack pointer at the moment SAD was entered
-        self.ssp = self.addr + SAD_SR + SAD_FRAME_SIZE
+        # Supervisor stack pointer at the moment SAD was entered. After a step SAD was
+        # entered by a trace exception: a 12 byte format 2 frame on a 68020+. (A 68000
+        # trace frame has no filler word and can't be told apart, so SSP is 2 too high.)
+        frame_size = SAD_FRAME_SIZE
+        if self.has_format:
+            frame_size = FRAME_SIZES.get(be16(buf, SAD_SR + 6) >> 12, SAD_FRAME_SIZE)
+        self.ssp = self.addr + SAD_SR + frame_size
         self.crash = None
         if alert is not None and (alert & 0x7FFFFF00) == 0:
             # CPU exception alerts are $800000vv / $000000vv, vv = vector number.
             vector = alert & 0xFF
-            frame = decode_frame(buf, SAD_SR + SAD_FRAME_SIZE, self.has_format, vector)
+            frame = decode_frame(buf, SAD_SR + frame_size, self.has_format, vector)
             if frame and frame["vector"] == vector:
                 frame["addr"] = self.ssp
                 self.crash = frame
@@ -730,7 +756,7 @@ def print_crash_frame(ctx, alert):
 
 
 def load_hunks(path):
-    """Parse an Amiga executable into hunks: dicts with size, data and relocs.
+    """Parse an Amiga executable into hunks: dicts with size, memflags, data and relocs.
 
     relocs is a list of (target hunk, [offsets]); each offset holds a long to
     which the target hunk's load address must be added.
@@ -761,9 +787,10 @@ def load_hunks(path):
     hunks = []
     for _ in range(count):
         word = u32()
-        if word >> 30 == 3:
-            u32()  # extended memory attributes
-        hunks.append(dict(size=(word & 0x3FFFFFFF) * 4, data=b"", relocs=[]))
+        memflags = {0: 0, 1: MEMF_CHIP, 2: MEMF_FAST}.get(word >> 30)
+        if memflags is None:
+            memflags = u32()  # extended memory attributes
+        hunks.append(dict(size=(word & 0x3FFFFFFF) * 4, memflags=memflags, data=b"", relocs=[]))
     for hunk in hunks:
         while True:
             btype = u32() & 0x3FFFFFFF
@@ -792,6 +819,38 @@ def load_hunks(path):
             else:
                 raise ValueError(f"unsupported hunk type ${btype:X} at file offset {pos - 4}")
     return hunks
+
+
+def relocate(image, relocs, bases):
+    """Add each target hunk's load address to the longs its relocs point at."""
+    for target, offs in relocs:
+        for off in offs:
+            value = (be32(image, off) + bases[target]) & 0xFFFFFFFF
+            image[off:off + 4] = value.to_bytes(4, "big")
+
+
+def decode_insn(md, buf, off, addr):
+    """(size, text) for the instruction at buf[off]; a word that doesn't decode becomes dc.w."""
+    insn = next(md.disasm(buf[off:], addr, 1), None)
+    if insn is None:
+        return 2, f"{'dc.w':<8} ${be16(buf, off):04x}"
+    return insn.size, f"{insn.mnemonic:<8} {insn.op_str}".rstrip()
+
+
+def insn_words(buf, off, size):
+    """An instruction's bytes as hex words, at most 10 bytes ('+' when longer)."""
+    words = " ".join(buf[off + i:off + i + 2].hex() for i in range(0, min(size, 10), 2))
+    return words + ("+" if size > 10 else "")
+
+
+def print_step_regs(regs, prev=None):
+    """Registers from Monitor.read_regs, with * after the ones that changed since prev."""
+    mark = lambda name: "*" if prev and prev[name] != regs[name] else " "
+    rows = [[f"D{i}" for i in range(4)], [f"D{i}" for i in range(4, 8)],
+            [f"A{i}" for i in range(4)], [f"A{i}" for i in range(4, 7)] + ["USP"]]
+    for row in rows:
+        print("    " + "  ".join(f"{name}{mark(name)}{regs[name]:08X}" for name in row))
+    print(f"    SR{mark('SR')}{regs['SR']:04X} ({format_sr(regs['SR'])})  PC{mark('PC')}{regs['PC']:08X}")
 
 
 def report_guru(amiga):
@@ -944,6 +1003,10 @@ class Monitor:
         self.alert = alert
         self.left_in_sad = True
         self.next_addr = 0
+        self.next_di = None  # where di continues; None: start at the saved PC
+        self.md = None  # Capstone disassembler, made on first use
+        self.running = False  # the Amiga left SAD and we're waiting for it to come back
+        self.last_seg = None  # first hunk of the last loadseg, call's default
         # Held while a command talks to the Amiga, so heartbeats never land mid-command
         self.busy = threading.Lock()
         self.stop_heartbeat = threading.Event()
@@ -1050,6 +1113,409 @@ class Monitor:
         hexdump(addr, self.amiga.readmem(addr, length))
         self.next_addr = addr + length
 
+    def cmd_disasm(self, args):
+        """di [addr] [count]  disassemble count instructions (default 16; addr: saved PC, then continues)"""
+        md = self.disassembler()
+        if md is None:
+            print("Disassembly needs Capstone: pip install capstone")
+            return
+        if args:
+            addr = parse_hex(args[0])
+        elif self.next_di is not None:
+            addr = self.next_di
+        else:
+            addr = read_context(self.amiga).pc
+        count = parse_hex(args[1]) if len(args) > 1 else DISASM_COUNT
+        if count <= 0:
+            raise ValueError("count must be > 0")
+        if addr & 1:
+            raise ValueError(f"${addr:08X} is odd")
+        buf = self.amiga.readmem(addr, count * MAX_INSN_SIZE)
+        off = 0
+        for _ in range(count):
+            if off + 2 > len(buf):
+                break
+            size, text = decode_insn(md, buf, off, addr + off)
+            print(f"{addr + off:08X}  {insn_words(buf, off, size):<25} {text}")
+            off += size
+        self.next_di = addr + off
+
+    def disassembler(self):
+        """A Capstone disassembler for this Amiga's CPU, or None without Capstone."""
+        if self.md is None:
+            try:
+                import capstone
+            except ImportError:
+                return None
+            attn = self.amiga.peek16(self.amiga.peek32(4) + EXEC_ATTNFLAGS)
+            mode = next((m for bit, m in DISASM_CPUS if attn & bit), "CS_MODE_M68K_000")
+            self.md = capstone.Cs(capstone.CS_ARCH_M68K, capstone.CS_MODE_BIG_ENDIAN | getattr(capstone, mode))
+        return self.md
+
+    def print_insn(self, prefix, pc):
+        """One line: prefix, PC, and the instruction there (just its words without Capstone).
+
+        Returns the instruction's first word.
+        """
+        buf = self.amiga.readmem(pc, MAX_INSN_SIZE)
+        md = self.disassembler()
+        size, text = decode_insn(md, buf, 0, pc) if md else (6, "")
+        print(f"{prefix}{pc:08X}  {insn_words(buf, 0, size):<25} {text}".rstrip())
+        return be16(buf, 0)
+
+    # SAD's single step (TURN_ON_SINGLE/TURN_OFF_SINGLE), which pyamigadebug has no methods for.
+    # TURN_ON_SINGLE points the trace vector at SAD's entry and sets T1 in the saved SR, so
+    # each RETURN_TO_SYSTEM runs one instruction and comes straight back into SAD.
+
+    def sad_command(self, name, args=b"", reply=0):
+        """Send a SAD command and return its reply data, leaving SAD at its prompt."""
+        amiga = self.amiga
+        amiga._flush()
+        amiga.serial.write(b"\xAF" + amiga.sadcmd[name] + args)
+        amiga.serial.flush()
+        amiga.serial.read(4)  # ack and status
+        data = amiga.serial.read(reply)
+        amiga._sync()
+        return data
+
+    def trace_on(self):
+        """Point the trace vector at SAD (and set T1 in the saved SR); returns the old vector."""
+        return int.from_bytes(self.sad_command("TURN_ON_SINGLE", reply=4), "big")
+
+    def trace_off(self, old_vector):
+        """Put the trace vector back and clear T1 in the saved SR."""
+        self.sad_command("TURN_OFF_SINGLE", old_vector.to_bytes(4, "big"), reply=4)
+
+    def can_trace(self, what):
+        if self.amiga.debugger != "SAD":
+            print(f"{what} needs SAD's single step; {self.amiga.debugger} doesn't have one.")
+            return False
+        if self.amiga.entry == "Crash":
+            print(f"Refusing {what}: after a crash, returning to the system reboots it.")
+            return False
+        return True
+
+    def run_until_sad(self, why, left):
+        """RETURN_TO_SYSTEM, then wait for SAD to be entered again; returns how it was entered."""
+        self.running = True
+        self.amiga.resume()
+        warned = False
+        while True:
+            try:
+                self.amiga._sync()
+                break
+            except KeyboardInterrupt:
+                if warned:
+                    raise
+                warned = True
+                print(f"\nThe Amiga is running until {why}, and can't be stopped from here. "
+                      f"Ctrl-C again to quit anyway: {left}.")
+        self.running = False
+        # The entry's exception frame can differ in size, which moves SAD's context
+        self.amiga._ctxframe = self.amiga._get_context_frame()
+        self.next_di = None
+        return self.amiga.entry
+
+    @staticmethod
+    def trace_left(old):
+        return f"SAD's trace vector stays installed (the original was ${old:08X}, at VBR+${VEC_TRACE:X})"
+
+    @contextlib.contextmanager
+    def ctrl_c_stops(self):
+        """While stepping, Ctrl-C stops after the current step instead of mid-command."""
+        self.stop_requested = False
+
+        def handler(signum, frame):
+            if self.stop_requested and self.running:
+                raise KeyboardInterrupt  # lets run_until_sad explain the Amiga is running
+            if not self.stop_requested:
+                self.stop_requested = True
+                print("\nStopping after this step.")
+
+        old = signal.signal(signal.SIGINT, handler)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, old)
+
+    def set_frame_trace(self, on):
+        """Set or clear T1 in SAD's saved SR, i.e. whether resuming runs one instruction."""
+        addr = self.amiga._ctxframe + SAD_SR
+        sr = self.amiga.peek16(addr)
+        self.amiga.poke16(addr, sr | SR_T1 if on else sr & ~SR_T1)
+
+    def read_regs(self):
+        """D0-D7, A0-A6, USP, SR and PC from SAD's context."""
+        buf = self.amiga.readmem(self.amiga._ctxframe, SAD_PC + 4)
+        regs = {f"D{i}": be32(buf, SAD_D0 + 4 * i) for i in range(8)}
+        regs.update({f"A{i}": be32(buf, SAD_A0 + 4 * i) for i in range(7)})
+        # Leave out the trace bit stepping itself sets
+        regs.update(USP=be32(buf, SAD_USP), SR=be16(buf, SAD_SR) & ~SR_T1, PC=be32(buf, SAD_PC))
+        return regs
+
+    def cmd_step(self, args):
+        """step [n]        run n instructions (default 1) with SAD's trace, showing registers after each"""
+        count = parse_hex(args[0]) if args else 1
+        if count <= 0:
+            raise ValueError("count must be > 0")
+        if not self.can_trace("step"):
+            return
+        old = self.trace_on()
+        try:
+            with self.ctrl_c_stops():
+                regs = self.read_regs()
+                for n in range(1, count + 1):
+                    if self.stop_requested:
+                        break
+                    self.print_insn(f"#{n:<4} ", regs["PC"])
+                    entry = self.run_until_sad("the instruction has run", self.trace_left(old))
+                    if entry != "Debug()":
+                        print(f"  Stopped: {self.amiga.debugger} was entered via {entry} instead.")
+                        return
+                    prev, regs = regs, self.read_regs()
+                    print_step_regs(regs, prev)
+        finally:
+            if not self.running:
+                self.trace_off(old)
+
+    def cmd_stepto(self, args):
+        """stepto task|addr|rts  run until a task is scheduled, the PC reaches addr, or the function returns"""
+        if not args:
+            raise ValueError("usage: stepto task|addr|rts")
+        if not self.can_trace("stepto"):
+            return
+        arg = " ".join(args)
+        if arg.lower() == "rts":
+            self.step_to_return()
+            return
+        # A task name, or a task's address; any other address is where to stop
+        tasks = self.all_tasks()
+        task = self.task_named(arg, tasks)
+        if task is None:
+            try:
+                addr = parse_hex(arg)
+            except ValueError:
+                raise ValueError(f"'{arg}' is neither a task nor an address") from None
+            if not any(t == addr for _, t in tasks):
+                if addr & 1:
+                    raise ValueError(f"${addr:08X} is odd")
+                self.step_to_address(addr)
+                return
+            task = addr
+        self.step_to_task(task)
+
+    def step_to_address(self, addr):
+        """Run until the PC reaches addr: at full speed with a breakpoint if addr is writable."""
+        regs = self.read_regs()
+        if regs["PC"] == addr:
+            # Get off it first, so this stops the next time addr is reached
+            old = self.trace_on()
+            try:
+                entry = self.run_until_sad("the instruction has run", self.trace_left(old))
+            finally:
+                if not self.running:
+                    self.trace_off(old)
+            if entry != "Debug()":
+                print(f"Stopped: {self.amiga.debugger} was entered via {entry} instead.")
+                return
+        original = self.amiga.peek16(addr)
+        self.amiga.poke16(addr, OP_ILLEGAL)
+        if self.amiga.peek16(addr) == OP_ILLEGAL:
+            self.run_to_breakpoint(addr, original)
+        else:
+            self.trace_to(addr)
+
+    def run_to_breakpoint(self, addr, original):
+        """addr holds an ILLEGAL: run untraced with the illegal instruction vector on SAD.
+
+        The illegal instruction exception leaves the PC on the ILLEGAL itself, so SAD is
+        entered with PC = addr, and the original word goes back before anything runs it.
+        """
+        execbase = self.amiga.peek32(4)
+        task = self.amiga.peek32(execbase + EXEC_THISTASK)
+        old = self.trace_on()  # also clears the caches, now the breakpoint is written
+        vbr = self.amiga.peek32(self.amiga._ctxframe + SAD_VBR)
+        sad_entry = self.amiga.peek32(vbr + VEC_TRACE)  # where TURN_ON_SINGLE pointed it
+        old_illegal = self.amiga.peek32(vbr + VEC_ILLEGAL)
+        self.set_frame_trace(False)
+        self.amiga.poke32(vbr + VEC_ILLEGAL, sad_entry)
+        left = (f"{self.trace_left(old)}, the illegal instruction vector too (originally "
+                f"${old_illegal:08X}, at VBR+${VEC_ILLEGAL:X}), and the breakpoint at ${addr:08X} "
+                f"(the original word was ${original:04X})")
+        print(f"Running until ${addr:08X} is reached...")
+        try:
+            entry = self.run_until_sad(f"${addr:08X} is reached", left)
+            self.amiga.poke16(addr, original)
+            self.amiga.poke32(vbr + VEC_ILLEGAL, old_illegal)
+        finally:
+            if not self.running:
+                self.trace_off(old)  # clears the caches again, now the original word is back
+        regs = self.read_regs()
+        if entry != "Debug()" or regs["PC"] != addr:
+            print(f"Stopped before ${addr:08X} was reached: {self.amiga.debugger} was entered via "
+                  f"{entry} at ${regs['PC']:08X}.")
+            return
+        hit = self.amiga.peek32(execbase + EXEC_THISTASK)
+        where = "" if hit == task else f" in {task_info(self.amiga, hit)[4]} (${hit:08X})"
+        print(f"Reached ${addr:08X}{where}.")
+        print_step_regs(regs)
+        self.print_insn("  next ", addr)
+
+    def trace_to(self, addr):
+        """Single-step this task until the PC is addr (for addresses a breakpoint can't go in)."""
+        print(f"${addr:08X} isn't writable (ROM?), so single-stepping this task until it gets there; "
+              "this is slow, and Ctrl-C stops it.")
+        old = self.trace_on()
+        n = 0
+        try:
+            with self.ctrl_c_stops():
+                while not self.stop_requested:
+                    entry = self.run_until_sad("the instruction has run", self.trace_left(old))
+                    if entry != "Debug()":
+                        print(f"Stopped: {self.amiga.debugger} was entered via {entry} instead.")
+                        return
+                    n += 1
+                    pc = self.amiga.peek32(self.amiga._ctxframe + SAD_PC)
+                    if pc == addr:
+                        break
+                    if n % TRACE_PROGRESS == 0:
+                        print(f"  ${n:X} instructions, PC ${pc:08X}")
+        finally:
+            if not self.running:
+                self.trace_off(old)
+        regs = self.read_regs()
+        print(f"{'Reached' if regs['PC'] == addr else 'Stopped'} after ${n:X} instructions.")
+        print_step_regs(regs)
+        self.print_insn("  next ", regs["PC"])
+
+    def step_to_task(self, task):
+        name = task_info(self.amiga, task)[4]
+        state = {t: label for label, t in self.all_tasks()}.get(task)
+        if state == "run":
+            print(f"{name} is the task that's in the debugger already.")
+            return
+        if state is None:
+            print(f"Refusing stepto: {name} isn't in exec's ready or wait lists, so it won't be scheduled.")
+            return
+        # Its switch frame at tc_SPReg is [FPU state][PC.l][SR.w][D0-D7/A0-A6]; exec's
+        # dispatcher RTEs to that SR, so with T1 set it traps into SAD after one instruction.
+        execbase = self.amiga.peek32(4)
+        spreg = self.amiga.peek32(task + TC_SPREG)
+        off = 0
+        if self.amiga.peek16(execbase + EXEC_ATTNFLAGS) & AFF_FPU:
+            if self.amiga.peek8(spreg) != 0:
+                print(f"Refusing stepto: {name} has saved FPU state, so its saved SR can't be found.")
+                return
+            off = 4  # null fsave frame
+        saved_pc = self.amiga.peek32(spreg + off)
+        sr_addr = spreg + off + 4
+        sr = self.amiga.peek16(sr_addr)
+        old = self.trace_on()
+        # TURN_ON_SINGLE traces the task in the debugger too; only the target should be
+        ctx_sr = self.amiga._ctxframe + SAD_SR
+        self.amiga.poke16(ctx_sr, self.amiga.peek16(ctx_sr) & ~SR_T1)
+        self.amiga.poke16(sr_addr, sr | SR_T1)
+        print(f"Running until {name} (${task:08X}, {state}) is scheduled...")
+        try:
+            entry = self.run_until_sad(f"{name} is scheduled", self.trace_left(old))
+            if self.amiga.peek32(execbase + EXEC_THISTASK) != task:
+                # Something else stopped it first; the target hasn't run, so its frame is unchanged
+                self.amiga.poke16(sr_addr, sr)
+                print(f"Stopped before {name} ran: {self.amiga.debugger} was entered via {entry}.")
+                return
+        finally:
+            if not self.running:
+                self.trace_off(old)
+        print(f"Stopped in {name} after its first instruction (it was switched out at ${saved_pc:08X}).")
+        regs = self.read_regs()
+        print_step_regs(regs)
+        self.print_insn("  next ", regs["PC"])
+
+    def rom_illegal(self):
+        """Address of an ILLEGAL ($4AFC) word: every resident's RomTag starts with one."""
+        table = self.amiga.peek32(self.amiga.peek32(4) + EXEC_RESMODULES)
+        for _ in range(MAX_LIST_NODES):
+            if not valid_ptr(table):
+                break
+            entry = self.amiga.peek32(table)
+            if entry == 0:
+                break
+            if entry & 0x80000000:  # link to a continuation table
+                table = entry & 0x7FFFFFFF
+                continue
+            if valid_ptr(entry) and self.amiga.peek16(entry) == RTC_MATCHWORD:
+                return entry
+            table += 4
+        return None
+
+    def step_to_return(self):
+        """Step until the current function returns, running the calls it makes at full speed.
+
+        A call is stepped into once, so the user stack pointer points at its return address.
+        That's replaced by the address of an ILLEGAL, with the illegal instruction vector
+        pointing at SAD's entry; the callee then runs untraced and its rts traps straight
+        back into SAD, where the real return address is put in the PC.
+        """
+        regs = self.read_regs()
+        if regs["SR"] & 0x2000:
+            print("stepto rts only works in user mode code (calls are stepped over on the user stack).")
+            return
+        trap_addr = self.rom_illegal()
+        if trap_addr is None:
+            print("Can't find an ILLEGAL ($4AFC) in a resident's RomTag to return to.")
+            return
+        execbase = self.amiga.peek32(4)
+        task = self.amiga.peek32(execbase + EXEC_THISTASK)
+        old = self.trace_on()
+        vbr = self.amiga.peek32(self.amiga._ctxframe + SAD_VBR)
+        sad_entry = self.amiga.peek32(vbr + VEC_TRACE)  # where TURN_ON_SINGLE pointed it
+        old_illegal = self.amiga.peek32(vbr + VEC_ILLEGAL)
+        n, returned = 0, False
+        try:
+            with self.ctrl_c_stops():
+                while not self.stop_requested:
+                    n += 1
+                    op = self.print_insn(f"#{n:<4} ", regs["PC"])
+                    entry = self.run_until_sad("the instruction has run", self.trace_left(old))
+                    if entry != "Debug()":
+                        print(f"  Stopped: {self.amiga.debugger} was entered via {entry} instead.")
+                        return
+                    regs = self.read_regs()
+                    if op in OP_RETURNS:
+                        returned = True
+                        break
+                    if not is_call(op):
+                        continue
+                    # In the callee: run it to its return
+                    slot = regs["USP"]
+                    ret = self.amiga.peek32(slot)
+                    self.amiga.poke32(slot, trap_addr)
+                    self.amiga.poke32(vbr + VEC_ILLEGAL, sad_entry)
+                    self.set_frame_trace(False)
+                    left = (f"{self.trace_left(old)}, the illegal instruction vector too (originally "
+                            f"${old_illegal:08X}, at VBR+${VEC_ILLEGAL:X}), and the return address at "
+                            f"${slot:08X} was replaced by ${trap_addr:08X} (originally ${ret:08X})")
+                    entry = self.run_until_sad("the call returns", left)
+                    self.amiga.poke32(vbr + VEC_ILLEGAL, old_illegal)
+                    regs = self.read_regs()
+                    if (entry != "Debug()" or regs["PC"] != trap_addr
+                            or self.amiga.peek32(execbase + EXEC_THISTASK) != task):
+                        # Something else entered SAD; the call is still running
+                        self.amiga.poke32(slot, ret)
+                        print(f"  Stopped: {self.amiga.debugger} was entered via {entry} at "
+                              f"${regs['PC']:08X} before the call returned.")
+                        return
+                    self.amiga.poke32(self.amiga._ctxframe + SAD_PC, ret)
+                    self.set_frame_trace(True)
+                    regs = self.read_regs()
+                    print(f"      returned to ${ret:08X}  D0 ${regs['D0']:08X}")
+        finally:
+            if not self.running:
+                self.trace_off(old)
+        print(f"{'Returned' if returned else 'Stopped'} after {n} instruction{'s' * (n != 1)} at this level.")
+        print_step_regs(regs)
+        self.print_insn("  next ", regs["PC"])
+
     def cmd_tasks(self, args):
         """t               list tasks (* = task that caused the guru)"""
         execbase = self.amiga.peek32(4)
@@ -1073,9 +1539,8 @@ class Monitor:
             tasks += [(label, t) for t in self.collect(label, execbase + offset)]
         return [(label, t) for label, t in tasks if valid_ptr(t)]
 
-    def find_task(self, arg):
-        """A task by (case-insensitive) name or CLI command name, else by address."""
-        tasks = self.all_tasks()
+    def task_named(self, arg, tasks):
+        """The task with this (case-insensitive) name or CLI command name, or None."""
         wanted = arg.lower()
         for _, task in tasks:
             name = task_info(self.amiga, task)[4].lower()
@@ -1083,6 +1548,14 @@ class Monitor:
             command = name.split(": ", 1)[1].rstrip("]") if " [" in name else ""
             if name.split(" [")[0] == wanted or command == wanted or command.endswith(":" + wanted):
                 return task
+        return None
+
+    def find_task(self, arg):
+        """A task by (case-insensitive) name or CLI command name, else by address."""
+        tasks = self.all_tasks()
+        task = self.task_named(arg, tasks)
+        if task is not None:
+            return task
         try:
             addr = parse_hex(arg)
         except ValueError:
@@ -1414,15 +1887,15 @@ class Monitor:
         self.next_addr = addr
 
     def cmd_write_byte(self, args):
-        """wb addr val ... write bytes"""
+        """wb addr val ...  write bytes"""
         self.write_values(args, 1)
 
     def cmd_write_word(self, args):
-        """ww addr val ... write words (even address)"""
+        """ww addr val ...  write words (even address)"""
         self.write_values(args, 2)
 
     def cmd_write_long(self, args):
-        """wl addr val ... write longs (even address)"""
+        """wl addr val ...  write longs (even address)"""
         self.write_values(args, 4)
 
     def cmd_upload(self, args):
@@ -1660,10 +2133,7 @@ class Monitor:
         images, tags = [], []
         for n, hunk in enumerate(hunks):
             image = bytearray(hunk["data"].ljust(hunk["size"], b"\0"))
-            for target, offs in hunk["relocs"]:
-                for off in offs:
-                    value = (be32(image, off) + bases[target]) & 0xFFFFFFFF
-                    image[off:off + 4] = value.to_bytes(4, "big")
+            relocate(image, hunk["relocs"], bases)
             for off in range(0, len(image) - RT_SIZE + 1, 2):
                 if be16(image, off) == RTC_MATCHWORD and be32(image, off + RT_MATCHTAG) == bases[n] + off:
                     tags.append((bases[n] + off, image, off))
@@ -1705,6 +2175,151 @@ class Monitor:
             print(f"Added resident ${addr:08X} {name} (version {image[off + RT_VERSION]}, "
                   f"pri {int.from_bytes(image[off + RT_PRI:off + RT_PRI + 1], 'big', signed=True)})")
         print(f"KickCheckSum ${checksum:08X}. Reboot (reboot command) to start the module.")
+
+    def cmd_loadseg(self, args):
+        """loadseg file    load an executable into memory as a DOS seglist, like LoadSeg()"""
+        if len(args) != 1:
+            raise ValueError("usage: loadseg file")
+        try:
+            hunks = load_hunks(args[0])
+        except OSError as e:
+            print(f"Can't read {args[0]}: {e.strerror}")
+            return
+        if not hunks:
+            print(f"{args[0]} has no hunks.")
+            return
+        if not self.system_callable("loadseg"):
+            return
+        saved = self.begin_calls()
+        try:
+            self.load_seglist(hunks)
+        finally:
+            self.end_calls(saved)
+
+    def load_seglist(self, hunks):
+        # Each hunk gets its own block, laid out as LoadSeg() does so UnLoadSeg() can
+        # free it: [allocation size][BPTR to next segment][hunk]. Segment BPTRs point
+        # at the next pointer.
+        blocks = []
+        for n, hunk in enumerate(hunks):
+            size = hunk["size"] + SEG_HEADER
+            flags = MEMF_PUBLIC | MEMF_CLEAR | hunk["memflags"]
+            block = self.exec_call(LVO_ALLOCMEM, d0=size, d1=flags)
+            if not block:
+                print(f"AllocMem({size}, ${flags:X}) failed for hunk {n}.")
+                for addr, length in blocks:
+                    self.exec_call(LVO_FREEMEM, a1=addr, d0=length)
+                return
+            blocks.append((block, size))
+        bases = [block + SEG_HEADER for block, _ in blocks]
+        for n, (hunk, (block, size)) in enumerate(zip(hunks, blocks)):
+            # Only the loaded data is sent; MEMF_CLEAR already zeroed the rest (BSS)
+            image = bytearray(hunk["data"])
+            end = max((off + 4 for _, offs in hunk["relocs"] for off in offs), default=0)
+            image.extend(bytes(max(0, end - len(image))))
+            relocate(image, hunk["relocs"], bases)
+            nxt = (blocks[n + 1][0] + 4) >> 2 if n + 1 < len(blocks) else 0
+            self.amiga.writemem(block, size.to_bytes(4, "big") + nxt.to_bytes(4, "big") + bytes(image))
+            mem = "chip" if hunk["memflags"] & MEMF_CHIP else "fast" if hunk["memflags"] & MEMF_FAST else "any"
+            print(f"  hunk {n}: ${bases[n]:08X}-${bases[n] + max(hunk['size'], 1) - 1:08X} "
+                  f"({hunk['size']} bytes, {mem} memory)")
+        self.exec_call(LVO_CACHECLEARU)
+        seglist = (blocks[0][0] + 4) >> 2
+        print(f"Seglist BPTR ${seglist:08X} (APTR ${seglist << 2:08X}), first hunk at ${bases[0]:08X}.")
+        print("Not freed automatically: release it with dos.library UnLoadSeg() when done.")
+        self.next_addr = self.last_seg = bases[0]
+
+    def cmd_allocmem(self, args):
+        """allocmem size [chip|fast]  AllocMem() cleared public memory and show its address"""
+        if not 1 <= len(args) <= 2:
+            raise ValueError("usage: allocmem size [chip|fast]")
+        size = parse_hex(args[0])
+        if size <= 0:
+            raise ValueError("size must be > 0")
+        kind = args[1].lower() if len(args) > 1 else "any"
+        if kind not in ("chip", "fast", "any"):
+            raise ValueError("memory type must be chip or fast")
+        flags = MEMF_PUBLIC | MEMF_CLEAR | {"chip": MEMF_CHIP, "fast": MEMF_FAST, "any": 0}[kind]
+        if not self.system_callable("allocmem"):
+            return
+        saved = self.begin_calls()
+        try:
+            addr = self.exec_call(LVO_ALLOCMEM, d0=size, d1=flags)
+        finally:
+            self.end_calls(saved)
+        if not addr:
+            print(f"AllocMem(${size:X}, ${flags:X}) failed.")
+            return
+        print(f"Allocated ${size:X} bytes at ${addr:08X}-${addr + size - 1:08X} ({kind}). "
+              f"Free with: freemem {addr:X} {size:X}")
+        self.next_addr = addr
+
+    def cmd_freemem(self, args):
+        """freemem addr size  FreeMem() a block (same size as it was allocated with)"""
+        if len(args) != 2:
+            raise ValueError("usage: freemem addr size")
+        addr, size = parse_hex(args[0]), parse_hex(args[1])
+        if size <= 0:
+            raise ValueError("size must be > 0")
+        if not self.system_callable("freemem"):
+            return
+        saved = self.begin_calls()
+        try:
+            self.exec_call(LVO_FREEMEM, a1=addr, d0=size)
+        finally:
+            self.end_calls(saved)
+        print(f"Freed ${size:X} bytes at ${addr:08X}.")
+
+    def cmd_call(self, args):
+        """call [addr] [reg=val ...]  jsr to addr (default: last loadseg) with d0-d7/a0-a6 set; shows D0/D1/A0/A1"""
+        addr, regs = self.last_seg, {}
+        for arg in args:
+            if "=" in arg:
+                reg, value = arg.lower().split("=", 1)
+                if reg not in CALL_ARG_REGS:
+                    raise ValueError(f"can't set '{reg}'; use d0-d7 or a0-a6")
+                regs[reg] = parse_hex(value)
+            else:
+                addr = parse_hex(arg)
+        if addr is None:
+            raise ValueError("usage: call [addr] [reg=val ...] (no loadseg to default to)")
+        if addr & 1:
+            raise ValueError(f"${addr:08X} is odd")
+        if not self.system_callable("call"):
+            return
+        saved = self.begin_calls()
+        # Return through DEBUG_STUB, which reloads ExecBase into A6 for Debug():
+        # the called code is free to change A6.
+        stub = self.exec_call(LVO_ALLOCMEM, d0=len(DEBUG_STUB), d1=MEMF_PUBLIC)
+        if not stub:
+            self.end_calls(saved)
+            print("Out of memory.")
+            return
+        self.amiga.writemem(stub, DEBUG_STUB)
+        self.exec_call(LVO_CACHECLEARU)
+        # The code runs with interrupts on, as a normal subroutine of the Debug() caller
+        self.exec_call(LVO_ENABLE)
+        print(f"Calling ${addr:08X}...")
+        old = self.amiga.execdebug
+        self.amiga.execdebug = stub
+        try:
+            self.amiga.callargs(addr=addr, result="d0", **regs)
+        finally:
+            self.amiga.execdebug = old
+        if self.amiga.entry != "Debug()":
+            # It crashed (or hit an NMI) instead of returning: our saved state is meaningless now
+            print(f"The code didn't return: {self.amiga.debugger} was entered via {self.amiga.entry}. "
+                  "Registers were not restored.")
+            return
+        results = dict(self.amiga.getregs(SCRATCH_REGS))
+        self.exec_call(LVO_DISABLE)
+        self.exec_call(LVO_FREEMEM, a1=stub, d0=len(DEBUG_STUB))
+        # Like a real function call: everything comes back except the scratch
+        # registers, which keep the results (and show up in r)
+        self.end_calls([(reg, results.get(reg, value)) for reg, value in saved])
+        d0 = results["d0"]
+        print(f"Returned D0 = ${d0:08X} ({d0 - (1 << 32) if d0 & 0x80000000 else d0})  "
+              + "  ".join(f"{reg.upper()} ${results[reg]:08X}" for reg in SCRATCH_REGS[1:]))
 
     def print_kick(self, execbase):
         mem = self.amiga.peek32(execbase + EXEC_KICKMEMPTR)
@@ -2079,8 +2694,11 @@ class Monitor:
 
     def cmd_help(self, args):
         """?               show this help"""
-        for doc in dict.fromkeys(f.__doc__ for f in self.commands.values()):
-            print("  " + doc)
+        # Each docstring is "usage  description", split at the first run of 2+ spaces
+        rows = [re.split(r" {2,}", doc, maxsplit=1) for doc in dict.fromkeys(f.__doc__ for f in self.commands.values())]
+        width = max(len(usage) for usage, _ in rows)
+        for usage, text in rows:
+            print(f"  {usage:<{width}}  {text}")
 
     def cmd_quit(self, args):
         """q               quit monitor (Amiga stays in the debugger)"""
@@ -2088,6 +2706,9 @@ class Monitor:
 
     commands = {
         "m": cmd_memory,
+        "di": cmd_disasm,
+        "step": cmd_step,
+        "stepto": cmd_stepto,
         "r": cmd_registers,
         "wb": cmd_write_byte,
         "ww": cmd_write_word,
@@ -2106,6 +2727,10 @@ class Monitor:
         "res": cmd_residents,
         "dos": cmd_dos,
         "kick": cmd_kick,
+        "loadseg": cmd_loadseg,
+        "call": cmd_call,
+        "allocmem": cmd_allocmem,
+        "freemem": cmd_freemem,
         "dread": cmd_dread,
         "dwrite": cmd_dwrite,
         "get": cmd_get,
