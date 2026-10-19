@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 import types
 
@@ -25,6 +26,10 @@ import serial
 
 HISTORY_FILE = os.path.expanduser("~/.pyamigamon_history")
 HISTORY_LENGTH = 1000
+# SAD gives up waiting for a command after a CPU busy loop and returns to the
+# system after 10 timeouts in a row; a NOP resets that count. The loop is much
+# shorter on a fast (emulated) CPU than on a stock A500, so keep this short.
+SAD_HEARTBEAT = 1.0
 _history_loaded = False
 DEFAULT_PYAMIGADEBUG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pyamigadebug")
 
@@ -939,6 +944,9 @@ class Monitor:
         self.alert = alert
         self.left_in_sad = True
         self.next_addr = 0
+        # Held while a command talks to the Amiga, so heartbeats never land mid-command
+        self.busy = threading.Lock()
+        self.stop_heartbeat = threading.Event()
 
     def setup_readline(self):
         """Line editing, persistent history and tab completion, when interactive."""
@@ -973,11 +981,33 @@ class Monitor:
             readline.parse_and_bind("tab: complete")
         return readline
 
+    def heartbeat(self):
+        """Keep SAD from returning to the system while we sit at the prompt."""
+        while not self.stop_heartbeat.wait(SAD_HEARTBEAT):
+            with self.busy:
+                if self.stop_heartbeat.is_set():
+                    return
+                try:
+                    self.amiga.nop()
+                except (OSError, serial.SerialException):
+                    return
+
+    def ask(self, prompt):
+        """input() from inside a command, letting heartbeats through while we wait."""
+        self.busy.release()
+        try:
+            return input(prompt)
+        finally:
+            self.busy.acquire()
+
     def run(self):
         readline = self.setup_readline()
+        if self.amiga.debugger == "SAD":  # RomWack has no NOP
+            threading.Thread(target=self.heartbeat, daemon=True).start()
         try:
             self.loop()
         finally:
+            self.stop_heartbeat.set()
             if readline:
                 try:
                     readline.write_history_file(HISTORY_FILE)
@@ -1000,8 +1030,11 @@ class Monitor:
                 print(f"Unknown command '{cmd}'. Type ? for help.")
                 continue
             try:
-                if handler(self, args) is False:
-                    return
+                with self.busy:
+                    if handler(self, args) is False:
+                        # The Amiga may have left the debugger: no more NOPs
+                        self.stop_heartbeat.set()
+                        return
             except ValueError as e:
                 print(f"Bad argument: {e}")
             except (struct.error, OverflowError, IndexError) as e:
@@ -1800,7 +1833,7 @@ class Monitor:
             raise ValueError(f"file is {len(data)} bytes; it must be a non-zero multiple of {BLOCK_SIZE}")
         count = len(data) // BLOCK_SIZE
         if sys.stdin.isatty():
-            answer = input(f"Overwrite {count} block(s) at ${block:X} on {device} unit {unit}? [y/N] ")
+            answer = self.ask(f"Overwrite {count} block(s) at ${block:X} on {device} unit {unit}? [y/N] ")
             if answer.strip().lower() not in ("y", "yes"):
                 print("Cancelled.")
                 return
@@ -1958,7 +1991,7 @@ class Monitor:
                 lock = d.dos(LVO_LOCK, d1=d.path, d2=SHARED_LOCK & 0xFFFFFFFF)
                 if lock:
                     d.dos(LVO_UNLOCK, d1=lock)
-                    if input(f"{path} exists. Overwrite? [y/N] ").strip().lower() not in ("y", "yes"):
+                    if self.ask(f"{path} exists. Overwrite? [y/N] ").strip().lower() not in ("y", "yes"):
                         print("Cancelled.")
                         return None
             fh = d.dos(LVO_OPEN, d1=d.path, d2=MODE_OLDFILE if data is None else MODE_NEWFILE)
