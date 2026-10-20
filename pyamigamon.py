@@ -2762,8 +2762,9 @@ def main():
 
     sys.path.insert(0, os.path.abspath(args.pyamigadebug))
 
-    # Both debuggers run at 9600 baud; RomWack misses characters with 1 stop bit.
-    with serial.Serial(args.port, 9600, timeout=None, stopbits=2, exclusive=True) as port:
+    # Both debuggers run at 9600 baud, 8N1. They send back to back with one stop
+    # bit, which some adapters (e.g. a PL2303) garble when set for two.
+    with serial.Serial(args.port, 9600, timeout=None, exclusive=True) as port:
         ser = PushbackSerial(port)
         while True:
             if args.attach:

@@ -20,8 +20,7 @@ usually takes out everything you'd normally use to investigate.
   talking to.
 - A serial connection to the Amiga's serial port (null-modem cable, or an
   emulator's serial port; see [Testing with Copperline](#testing-with-copperline)).
-  Both debuggers run at 9600 baud; pyamigamon uses 8N2, since RomWack misses
-  characters with only one stop bit.
+  Both debuggers run at 9600 baud, 8N1.
 - Python 3.8+ and [pyserial](https://pypi.org/project/pyserial/) (`pip install pyserial`).
 - Optionally [Capstone](https://pypi.org/project/capstone/) (`pip install capstone`) for the `di` disassembler.
 - A checkout of [pyamigadebug](https://github.com/rvalles/pyamigadebug). By
